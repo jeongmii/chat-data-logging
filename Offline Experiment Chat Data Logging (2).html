@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Offline Experiment Chat Data Logging — CSV File</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:1280px;margin:24px auto;padding:0 16px}
+    h1{font-size:22px;margin:0 0 12px}
+    textarea,input,select,button{font-size:16px;padding:10px}
+    textarea{height:420px;width:100%}
+    table{width:100%;border-collapse:collapse;margin-top:12px}
+    th,td{border:1px solid #ddd;padding:6px 8px;font-size:14px;vertical-align:top}
+    th{background:#f7f7f8}
+    .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .sec{border:1px solid #e5e7eb;border-radius:12px;padding:12px;margin-bottom:12px}
+    .btn{cursor:pointer;border:1px solid #ccc;border-radius:10px;background:#fff;transition:.15s}
+    .btn:hover{background:#f5f5f5}
+  </style>
+</head>
+<body>
+  <h1>Offline Experiment Chat Data Logging — CSV File</h1>
+  <div class="sec">
+    <div class="row">
+      <input id="pname" placeholder="Participant_Name" />
+      <select id="cond">
+        <option value="SELF-CONCRETE">SELF-CONCRETE</option>
+        <option value="SELF-ABSTRACT">SELF-ABSTRACT</option>
+        <option value="OTHER-CONCRETE">OTHER-CONCRETE</option>
+        <option value="OTHER-ABSTRACT">OTHER-ABSTRACT</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="sec">
+    <b>Paste full conversation</b>
+    <textarea id="raw" placeholder="Paste here (Ctrl/⌘ + V)"></textarea>
+    <div class="row">
+      <button class="btn" id="parse">Convert to table</button>
+      <button class="btn" id="clear">Clear</button>
+    </div>
+  </div>
+
+  <div class="sec">
+    <div class="row">
+      <button class="btn" id="downloadCsv">Download CSV</button>
+      <button class="btn" id="downloadJson">Download JSON</button>
+      <button class="btn" id="reset">Reset table</button>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Participant_Name</th>
+          <th>Condition</th>
+          <th>Turn</th>
+          <th>Speaker</th>
+          <th>Message</th>
+          <th>Message_CharLen</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+
+  <script>
+    const pnameEl = document.getElementById('pname');
+    const condEl = document.getElementById('cond');
+    const rawEl = document.getElementById('raw');
+    const tbody = document.getElementById('tbody');
+
+    let rows = []; // {Participant_Name, Condition, Turn, Speaker, Message, Message_CharLen}
+
+    function escapeHtml(s){ return String(s).replace(/[&<>\"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;','\'':'&#39;'}[m])); }
+    function charLen(str){ try { return Array.from(str||'').length; } catch(e){ return (str||'').length; } }
+
+    // === Disclaimers / boilerplate to remove ===
+    const disclaimerREs = [
+      /ChatGPT는\s*실수를\s*할\s*수\s*있습니다\.?\s*중요한\s*정보는\s*재차\s*확인하세요\.?/g,
+      /ChatGPT\s*can\s*make\s*mistakes\.?\s*Check\s*important\s*info\.?/gi
+    ];
+    function cleanseText(t){
+      let s = String(t);
+      for(const re of disclaimerREs){ s = s.replace(re, ''); }
+      return s.trim();
+    }
+
+    function render(){
+      tbody.innerHTML = rows.map(r=>`<tr>
+        <td>${escapeHtml(r.Participant_Name)}</td>
+        <td>${escapeHtml(r.Condition)}</td>
+        <td>${r.Turn}</td>
+        <td>${escapeHtml(r.Speaker)}</td>
+        <td>${escapeHtml(r.Message)}</td>
+        <td>${r.Message_CharLen}</td>
+      </tr>`).join('');
+    }
+
+    function addRow(speaker, message){
+      const Participant_Name = pnameEl.value || 'UNKNOWN';
+      const Condition = condEl.value;
+      const Turn = rows.length + 1;
+      const msg = cleanseText(message);
+      const Message_CharLen = charLen(msg);
+      if(!msg) return; // 빈 메시지면 스킵 (디스클레임러만 있던 줄 등)
+      rows.push({ Participant_Name, Condition, Turn, Speaker: speaker, Message: msg, Message_CharLen });
+    }
+
+    function toCSV(){
+      const header = ["Participant_Name","Condition","Turn","Speaker","Message","Message_CharLen"];
+      const q = s => '"' + String(s).replace(/"/g,'""') + '"';
+      const lines = [header.join(',')];
+      for(const r of rows){
+        lines.push([r.Participant_Name,r.Condition,r.Turn,r.Speaker,r.Message,r.Message_CharLen].map(q).join(','));
+      }
+      return lines.join('\n');
+    }
+
+    function download(filename, content, type){
+      const blob = new Blob([content], {type});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename; a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    // ==== Parsing logic ====
+    // Strategy 1: Section-based split by titles: "나의 말:", "Eliva(C)의 말:", "Eliva(A)의 말:" ...
+    function parseBySections(text){
+      const lines = text.split(/\r?\n/);
+      const markers = [
+        { re: /^\s*나의\s*말\s*[:：]\s*$/u, who: 'Participant' },
+        { re: /^\s*Eliva\(\s*[A-Za-z]\s*\)\s*의\s*말\s*[:：]\s*$/u, who: 'GPT' },
+        { re: /^\s*Eliva\s*의\s*말\s*[:：]\s*$/u, who: 'GPT' },
+      ];
+
+      let found = false;
+      let current = null;
+      let buf = [];
+      const out = [];
+
+      function flush(){
+        if(current && buf.length){
+          let chunk = cleanseText(buf.join('\n'));
+          if(chunk){ out.push([current, chunk]); }
+        }
+        buf = [];
+      }
+
+      for(let raw of lines){
+        let line = cleanseText(String(raw).trim());
+        if(!line) continue;
+        let hit = null;
+        for(const m of markers){ if(m.re.test(line)){ hit = m; break; } }
+        if(hit){
+          found = true;
+          flush();
+          current = hit.who; // switch speaker
+          continue; // skip marker line
+        }
+        buf.push(line);
+      }
+      flush();
+      return { found, out };
+    }
+
+    // Strategy 2: Label-per-line fallback (User:/Assistant: etc.)
+    function parseByLineLabels(text){
+      const lines = text.split(/\r?\n/).map(s=>cleanseText(s.trim())).filter(Boolean);
+      const labelMap = [
+        [/^(참가자|Participant|User|You)\s*[:：]/i, 'Participant'],
+        [/^(GPT|Assistant|ChatGPT|Eliva)\s*[:：]/i, 'GPT']
+      ];
+      let anyLabel = false;
+      const out = [];
+      for(const ln of lines){
+        let matched = false;
+        for(const [re, who] of labelMap){
+          if(re.test(ln)){
+            anyLabel = true;
+            const msg0 = ln.replace(re, '').trim();
+            const msg = cleanseText(msg0);
+            if(msg){ out.push([who, msg]); }
+            matched = true; break;
+          }
+        }
+        if(!matched){ out.push([null, ln]); }
+      }
+      if(!anyLabel) return { found:false, out:[] };
+      // carry-forward unlabeled lines
+      const fixed=[]; let last='Participant';
+      for(const [who,msg] of out){ if(who){ last=who; fixed.push([who,msg]); } else { fixed.push([last,msg]); } }
+      return { found:true, out: fixed };
+    }
+
+    function parsePasted(text){
+      // 1) Try section-based parsing first
+      const sec = parseBySections(text);
+      if(sec.found) return sec.out;
+      // 2) Else try label-per-line fallback
+      const lbl = parseByLineLabels(text);
+      if(lbl.found) return lbl.out;
+      // 3) Else return empty (no reliable structure)
+      return [];
+    }
+
+    document.getElementById('parse').addEventListener('click', ()=>{
+      const arr = parsePasted(rawEl.value);
+      rows = [];
+      for(const [speaker, message] of arr){ addRow(speaker, message); }
+      render();
+    });
+
+    document.getElementById('clear').addEventListener('click', ()=>{ rawEl.value=''; });
+
+    document.getElementById('downloadCsv').addEventListener('click', ()=>{
+      if(rows.length===0){ alert('표에 데이터가 없습니다.'); return; }
+      const pname = pnameEl.value || 'UNKNOWN';
+      const cond  = condEl.value || 'COND';
+      const safe  = s => String(s).replace(/[\\\/:*?"<>|]/g,'').replace(/\s+/g,'-');
+      const fn    = `chat_${safe(pname)}_${safe(cond)}_${new Date().toISOString().slice(0,10)}.csv`;
+      download(fn, toCSV(), 'text/csv;charset=utf-8');
+    });
+
+    document.getElementById('downloadJson').addEventListener('click', ()=>{
+      if(rows.length===0){ alert('표에 데이터가 없습니다.'); return; }
+      const fn = `chat_${(pnameEl.value||'UNKNOWN')}_${new Date().toISOString().slice(0,10)}.json`;
+      download(fn, JSON.stringify(rows, null, 2), 'application/json');
+    });
+
+    document.getElementById('reset').addEventListener('click', ()=>{
+      if(!confirm('표를 초기화할까요?')) return;
+      rows = []; render();
+    });
+  </script>
+</body>
+</html>
